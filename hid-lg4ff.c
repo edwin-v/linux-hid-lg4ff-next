@@ -200,46 +200,6 @@ int lg4ff_adjust_input_event(struct hid_device *hid, struct hid_field *field,
 	}
 }
 
-static int hid_lg4ff_start_combined(struct hid_device *hid, struct hid_report *report,
-				    const struct mlnx_simple_force *force)
-{
-	__s32 *value = report->field[0]->value;
-	int scaled_x;
-
-	/* Scale down from MLNX range */
-	scaled_x = 0x80 - (force->x * 0xff / 0xffff);
-
-	value[0] = 0x11;	/* Slot 1 */
-	value[1] = 0x08;
-	value[2] = scaled_x;
-	value[3] = 0x80;
-	value[4] = 0x00;
-	value[5] = 0x00;
-	value[6] = 0x00;
-
-	printk(KERN_DEBUG "Wheel constant force cmd: %02x %02x %02x %02x %02x %02x %02x\n", 
-		value[0], value[1], value[2], value[3], value[4], value[5], value[6]);
-
-	hid_hw_request(hid, report, HID_REQ_SET_REPORT);
-	return 0;
-}
-
-static int hid_lg4ff_stop_combined(struct hid_device *hid, struct hid_report *report)
-{
-	__s32 *value = report->field[0]->value;
-
-	value[0] = 0x13;	/* Slot 1 */
-	value[1] = 0x00;
-	value[2] = 0x00;
-	value[3] = 0x00;
-	value[4] = 0x00;
-	value[5] = 0x00;
-	value[6] = 0x00;
-
-	hid_hw_request(hid, report, HID_REQ_SET_REPORT);
-	return 0;
-}
-
 static struct lg4ff_device_entry *hid_lg4ff_get_device_entry(struct hid_device *hid)
 {
 	struct lg4ff_device_entry *entry;
@@ -272,11 +232,70 @@ static __s8 hid_lg4ff_get_slot(struct lg4ff_device_entry *entry, __s16 effect_id
 	return -1;
 }
 
-static int hid_lg4ff_start_conditional(struct hid_device *hid, struct hid_report *report, const struct ff_effect *effect)
+static int hid_lg4ff_send_slot_command(struct hid_device *hid, struct hid_report *report, __u8 slot)
 {
 	__s32 *value = report->field[0]->value;
 	struct lg4ff_device_entry *entry = hid_lg4ff_get_device_entry(hid);
 	__u8 i, n, *old, *new;
+
+	old = entry->slot_playing[slot];
+	new = entry->slot_cmds[slot];
+
+	for (i = 0, n = 0; i < 7; i++) {
+		n += old[i] != new[i];
+		value[i] = old[i] = new[i];
+	}
+
+	if (n) {
+		printk(KERN_DEBUG "Wheel command: %02x %02x %02x %02x %02x %02x %02x\n", 
+		                  value[0], value[1], value[2], value[3], value[4], value[5], value[6]);
+
+		hid_hw_request(hid, report, HID_REQ_SET_REPORT);
+	}
+
+	return 0;
+}
+
+static int hid_lg4ff_start_combined(struct hid_device *hid, struct hid_report *report,
+				    const struct mlnx_simple_force *force)
+{
+	struct lg4ff_device_entry *entry = hid_lg4ff_get_device_entry(hid);
+	__u8 *cmd = entry->slot_cmds[0];
+	int scaled_x;
+
+	/* Scale down from MLNX range */
+	scaled_x = 0x80 - (force->x * 0xff / 0xffff);
+
+	cmd[0] = 0x11;		/* Combined force always in slot 1 */
+	cmd[1] = 0x08;
+	cmd[2] = scaled_x;
+	cmd[3] = 0x80;
+	cmd[4] = 0x00;
+	cmd[5] = 0x00;
+	cmd[6] = 0x00;
+
+	return hid_lg4ff_send_slot_command(hid, report, 0);
+}
+
+static int hid_lg4ff_stop_combined(struct hid_device *hid, struct hid_report *report)
+{
+	struct lg4ff_device_entry *entry = hid_lg4ff_get_device_entry(hid);
+	__u8 *cmd = entry->slot_cmds[0];
+
+	cmd[0] = 0x13;	/* Combined force always in slot 1 */
+	cmd[1] = 0x00;
+	cmd[2] = 0x00;
+	cmd[3] = 0x00;
+	cmd[4] = 0x00;
+	cmd[5] = 0x00;
+	cmd[6] = 0x00;
+
+	return hid_lg4ff_send_slot_command(hid, report, 0);
+}
+
+static int hid_lg4ff_start_conditional(struct hid_device *hid, struct hid_report *report, const struct ff_effect *effect)
+{
+	struct lg4ff_device_entry *entry = hid_lg4ff_get_device_entry(hid);
 	__s8 s;
 
 	if (!entry)
@@ -288,22 +307,7 @@ static int hid_lg4ff_start_conditional(struct hid_device *hid, struct hid_report
 	if (s < 0)
 		return -EINVAL;
 
-	old = entry->slot_playing[s];
-	new = entry->slot_cmds[s];
-
-	for (i = 0, n = 0; i < 7; i++) {
-		n += old[i] != new[i];
-		value[i] = old[i] = new[i];
-	}
-
-	if (n) {
-		printk(KERN_DEBUG "Wheel start cmd: %02x %02x %02x %02x %02x %02x %02x\n", 
-		                  value[0], value[1], value[2], value[3], value[4], value[5], value[6]);
-
-		hid_hw_request(hid, report, HID_REQ_SET_REPORT);
-	}
-
-	return 0;
+	return hid_lg4ff_send_slot_command(hid, report, s);
 }
 
 static int hid_lg4ff_upload_conditional(struct hid_device *hid, struct hid_report *report, const struct ff_effect *effect)
@@ -492,20 +496,10 @@ static void hid_lg4ff_set_autocenter_default(struct input_dev *dev, u16 magnitud
 	struct hid_report *report = list_entry(report_list->next, struct hid_report, list);
 	__s32 *value = report->field[0]->value;
 	__u32 expand_a, expand_b;
-	struct lg4ff_device_entry *entry;
-	struct lg_drv_data *drv_data;
+	struct lg4ff_device_entry *entry = hid_lg4ff_get_device_entry(hid);
 
-	drv_data = hid_get_drvdata(hid);
-	if (!drv_data) {
-		hid_err(hid, "Private driver data not found!\n");
+	if (!entry)
 		return;
-	}
-
-	entry = drv_data->device_props;
-	if (!entry) {
-		hid_err(hid, "Device properties not found!\n");
-		return;
-	}
 
 	/* De-activate Auto-Center */
 	if (magnitude == 0) {
@@ -675,21 +669,11 @@ static void hid_lg4ff_switch_native(struct hid_device *hid, const struct lg4ff_n
 static ssize_t lg4ff_range_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct hid_device *hid = to_hid_device(dev);
-	struct lg4ff_device_entry *entry;
-	struct lg_drv_data *drv_data;
+	struct lg4ff_device_entry *entry = hid_lg4ff_get_device_entry(hid);
 	size_t count;
 
-	drv_data = hid_get_drvdata(hid);
-	if (!drv_data) {
-		hid_err(hid, "Private driver data not found!\n");
+	if (!entry)
 		return 0;
-	}
-
-	entry = drv_data->device_props;
-	if (!entry) {
-		hid_err(hid, "Device properties not found!\n");
-		return 0;
-	}
 
 	count = scnprintf(buf, PAGE_SIZE, "%u\n", entry->range);
 	return count;
