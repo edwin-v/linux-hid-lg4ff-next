@@ -48,7 +48,6 @@
 #define FF_UPDATE_RATE 8
 
 #define to_hid_device(pdev) container_of(pdev, struct hid_device, dev)
-#define slot_playing(e, s) ((e->slot_playing[s][0] & 2) == 0)
 
 static void hid_lg4ff_set_range_dfp(struct hid_device *hid, u16 range);
 static void hid_lg4ff_set_range_g25(struct hid_device *hid, u16 range);
@@ -57,14 +56,19 @@ static ssize_t lg4ff_range_store(struct device *dev, struct device_attribute *at
 
 static DEVICE_ATTR(range, S_IRWXU | S_IRWXG | S_IRWXO, lg4ff_range_show, lg4ff_range_store);
 
+struct lg4ff_hw_effect_slot {
+	bool is_playing;
+	__s16 id;
+	__u8 uploaded_cmd[7];
+	__u8 sent_cmd[7];
+};
+
 struct lg4ff_device_entry {
 	__u32 product_id;
 	__u16 range;
 	__u16 min_range;
 	__u16 max_range;
-	__u8 slot_cmds[4][7];
-	__s16 slot_ids[4];
-	__u8 slot_playing[4][7];
+	struct lg4ff_hw_effect_slot hw_slots[4];
 #ifdef CONFIG_LEDS_CLASS
 	__u8  led_state;
 	struct led_classdev *led[5];
@@ -225,21 +229,21 @@ static __s8 hid_lg4ff_get_slot(struct lg4ff_device_entry *entry, __s16 effect_id
 	int i;
 	printk(KERN_DEBUG "Looking for effect %i, ", effect_id);
 	for (i = 1; i < 4; i++)
-		if (entry->slot_ids[i] == effect_id) {
+		if (entry->hw_slots[i].id == effect_id) {
 			printk(KERN_DEBUG "found slot %i.\n", i);
 			return i; }
 	printk(KERN_DEBUG "found nothing!\n");
 	return -1;
 }
 
-static int hid_lg4ff_send_slot_command(struct hid_device *hid, struct hid_report *report, __u8 slot)
+static int hid_lg4ff_send_slot_command(struct hid_device *hid, struct hid_report *report, 
+                                       struct lg4ff_device_entry *entry, __u8 slot)
 {
 	__s32 *value = report->field[0]->value;
-	struct lg4ff_device_entry *entry = hid_lg4ff_get_device_entry(hid);
 	__u8 i, n, *old, *new;
 
-	old = entry->slot_playing[slot];
-	new = entry->slot_cmds[slot];
+	old = entry->hw_slots[slot].sent_cmd;
+	new = entry->hw_slots[slot].uploaded_cmd;
 
 	for (i = 0, n = 0; i < 7; i++) {
 		n += old[i] != new[i];
@@ -260,7 +264,7 @@ static int hid_lg4ff_start_combined(struct hid_device *hid, struct hid_report *r
 				    const struct mlnx_simple_force *force)
 {
 	struct lg4ff_device_entry *entry = hid_lg4ff_get_device_entry(hid);
-	__u8 *cmd = entry->slot_cmds[0];
+	__u8 *cmd = entry->hw_slots[0].uploaded_cmd;
 	int scaled_x;
 
 	/* Scale down from MLNX range */
@@ -274,13 +278,13 @@ static int hid_lg4ff_start_combined(struct hid_device *hid, struct hid_report *r
 	cmd[5] = 0x00;
 	cmd[6] = 0x00;
 
-	return hid_lg4ff_send_slot_command(hid, report, 0);
+	return hid_lg4ff_send_slot_command(hid, report, entry, 0);
 }
 
 static int hid_lg4ff_stop_combined(struct hid_device *hid, struct hid_report *report)
 {
 	struct lg4ff_device_entry *entry = hid_lg4ff_get_device_entry(hid);
-	__u8 *cmd = entry->slot_cmds[0];
+	__u8 *cmd = entry->hw_slots[0].uploaded_cmd;
 
 	cmd[0] = 0x13;	/* Combined force always in slot 1 */
 	cmd[1] = 0x00;
@@ -290,7 +294,7 @@ static int hid_lg4ff_stop_combined(struct hid_device *hid, struct hid_report *re
 	cmd[5] = 0x00;
 	cmd[6] = 0x00;
 
-	return hid_lg4ff_send_slot_command(hid, report, 0);
+	return hid_lg4ff_send_slot_command(hid, report, entry, 0);
 }
 
 static int hid_lg4ff_start_conditional(struct hid_device *hid, struct hid_report *report, const struct ff_effect *effect)
@@ -307,7 +311,9 @@ static int hid_lg4ff_start_conditional(struct hid_device *hid, struct hid_report
 	if (s < 0)
 		return -EINVAL;
 
-	return hid_lg4ff_send_slot_command(hid, report, s);
+	entry->hw_slots[s].is_playing = true;
+
+	return hid_lg4ff_send_slot_command(hid, report, entry, s);
 }
 
 static int hid_lg4ff_upload_conditional(struct hid_device *hid, struct hid_report *report, const struct ff_effect *effect)
@@ -328,10 +334,10 @@ static int hid_lg4ff_upload_conditional(struct hid_device *hid, struct hid_repor
 		s = hid_lg4ff_get_slot(entry, -1);
 	
 	if (s < 0)
-		return -EINVAL;	/* no free slots */
+		return -ENOSPC;	/* no free slots */
 
-	entry->slot_ids[s] = effect->id;
-	cmd = entry->slot_cmds[s];
+	entry->hw_slots[s].id = effect->id;
+	cmd = entry->hw_slots[s].uploaded_cmd;
 
 	switch (effect->type) {
 	case FF_SPRING:
@@ -384,7 +390,7 @@ static int hid_lg4ff_upload_conditional(struct hid_device *hid, struct hid_repor
 	}
 
 	/* start updated effect if is currently playing */
-	if (slot_playing(entry, s))
+	if (entry->hw_slots[s].is_playing)
 		return hid_lg4ff_start_conditional(hid, report, effect);
 
 	return 0;
@@ -406,10 +412,11 @@ static int hid_lg4ff_stop_conditional(struct hid_device *hid, struct hid_report 
 	if (s < 0)
 		return -EINVAL;
 
-	if (!slot_playing(entry ,s))
+	if (!entry->hw_slots[s].is_playing)
 		return -EINVAL;
 
-	cmd = entry->slot_playing[s];
+	entry->hw_slots[s].is_playing = false;
+	cmd = entry->hw_slots[s].sent_cmd;
 
 	cmd[0] |= 2;
 	value[0] = cmd[0];
@@ -441,14 +448,10 @@ static int hid_lg4ff_erase_conditional(struct hid_device *hid, struct hid_report
 	if (s < 0)
 		return -EINVAL;
 
-	if (slot_playing(entry, s))
-		hid_lg4ff_stop_conditional(hid, report, effect);
-
-	entry->slot_ids[s] = -1;
+	entry->hw_slots[s].id = -1;
 	
 	printk(KERN_DEBUG "Wheel slot %i erased\n", s);
 
-	hid_hw_request(hid, report, HID_REQ_SET_REPORT);
 	return 0;
 }
 
@@ -874,8 +877,7 @@ int lg4ff_init(struct hid_device *hid)
 	entry->min_range = lg4ff_devices[i].min_range;
 	entry->max_range = lg4ff_devices[i].max_range;
 	entry->set_range = lg4ff_devices[i].set_range;
-	entry->slot_ids[0] = entry->slot_ids[1] = entry->slot_ids[2] = entry->slot_ids[3] = -1;
-	entry->slot_playing[0][0] = entry->slot_playing[1][0] = entry->slot_playing[2][0] = entry->slot_playing[3][0] = 0x13;
+	entry->hw_slots[0].id = entry->hw_slots[1].id = entry->hw_slots[2].id = entry->hw_slots[3].id = -1;
 
 	/* Check if autocentering is available and
 	 * set the centering force to zero by default */
