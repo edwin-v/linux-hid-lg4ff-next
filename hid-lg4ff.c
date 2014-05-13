@@ -378,9 +378,9 @@ static int hid_lg4ff_upload_conditional(struct hid_device *hid, struct hid_repor
 
 		cmd[0] = (16 << s) + 1;
 		cmd[1] = 0x0C;
-		cmd[2] = abs(y) & 0x0F;
+		cmd[2] = abs(y);
 		cmd[3] = y < 0;
-		cmd[4] = abs(x) & 0x0F;
+		cmd[4] = abs(x);
 		cmd[5] = x < 0;
 		cmd[6] = 0x01;
 		break;
