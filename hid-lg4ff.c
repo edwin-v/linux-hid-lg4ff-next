@@ -348,12 +348,8 @@ static int hid_lg4ff_upload_conditional(struct hid_device *hid, struct hid_repor
 		                  effect->u.condition[0].center,
 		                  effect->u.condition[0].deadband);
 		/* calculate offsets */
-		x = clamp(effect->u.condition[0].center - effect->u.condition[0].deadband + 0x8000, 0, 0xffff);
-		x = 0xffe * x / 0xffff;
-		x = x / 2 + (x & 1);
-		y = clamp(effect->u.condition[0].center + effect->u.condition[0].deadband + 0x8000, 0, 0xffff);
-		y = 0xffe * y / 0xffff;
-		y = y / 2 + (y & 1);
+		x = clamp(effect->u.condition[0].center - effect->u.condition[0].deadband/2 + 0x8000, 0, 0xffff) >> 5;
+		y = clamp(effect->u.condition[0].center + effect->u.condition[0].deadband/2 + 0x8000, 0, 0xffff) >> 5;
 		printk(KERN_DEBUG "offsets %x %x\n",  x, y);
 		/* calculate coefs */
 		cr = max(effect->u.condition[0].right_coeff / 2048, -15);
