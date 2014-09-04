@@ -75,6 +75,7 @@ static const signed short lg4ff_wheel_effects[] = {
 	FF_CONSTANT,
 	FF_SPRING,
 	FF_DAMPER,
+	FF_FRICTION,
 	FF_AUTOCENTER,
 	-1
 };
@@ -390,6 +391,22 @@ static int lg4ff_upload_effect(struct input_dev *dev,
 			c[4] = 16 * abs(cr) + abs(cl);
 			c[5] = (x & 7) * 32 + (cr & 16) + (y & 7) * 2 + (cl < 0);
 			c[6] = max(effect->u.condition[0].right_saturation / 256, 1);
+			break;
+		case FF_FRICTION:
+			printk(KERN_DEBUG "Wheel friction: %i %i, sat %i %i\n", effect->u.condition[0].right_coeff
+			                                                      , effect->u.condition[0].left_coeff
+			                                                      , effect->u.condition[0].right_saturation
+			                                                      , effect->u.condition[0].left_saturation);
+
+			/* calculate friction force values */
+			x = max(effect->u.condition[0].right_coeff / 256, -255);
+			y = max(effect->u.condition[0].left_coeff / 256, -255);
+			c[1] = 0x0E;
+			c[2] = abs(y);
+			c[3] = abs(x);
+			c[4] = effect->u.condition[0].right_saturation / 256;
+			c[5] = 16*(x < 0) + (y < 0);
+			c[6] = 0;
 			break;
 		default:
 			printk(KERN_DEBUG "Unexpected force type %i!", effect->type);
