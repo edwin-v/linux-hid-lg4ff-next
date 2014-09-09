@@ -33,6 +33,19 @@
 #include "hid-lg.h"
 #include "hid-ids.h"
 
+
+/* temp */
+#define FF_GAIN_PERIODIC	0x71
+#define FF_GAIN_CONSTANT	0x72
+#define FF_GAIN_SPRING		0x73
+#define FF_GAIN_FRICTION	0x74
+#define FF_GAIN_DAMPER		0x75
+#define FF_GAIN_INERTIA		0x76
+
+#define FF_GAIN_FULL 0xaaaa
+#define FF_GAIN_FULL_U 0xaaaau
+/* end temp */
+
 #define to_hid_device(pdev) container_of(pdev, struct hid_device, dev)
 
 #define LG4FF_MAX_EFFECTS 4
@@ -43,6 +56,12 @@
 #define CMD_STOP_FORCE		3
 #define CMD_REFRESH_FORCE	12
 
+/* Logitech uses a minimum of 8 ms between USB commands */
+#define COMMAND_RATE		8	
+/* command queue definition for a power-of-two queue size */
+#define COMMAND_QUEUE_SIZE	16
+#define NEXT_QUEUE(e)		((e->queue_start+1) & (COMMAND_QUEUE_SIZE-1))
+#define END_QUEUE(e)		((e->queue_start+e->queue_length) & (COMMAND_QUEUE_SIZE-1))
 
 static void hid_lg4ff_set_range_dfp(struct hid_device *hid, u16 range);
 static void hid_lg4ff_set_range_g25(struct hid_device *hid, u16 range);
@@ -57,18 +76,33 @@ struct lg4ff_hw_effect_slot {
 	__u8 last_cmd[7];
 };
 
+struct lg4ff_gain_levels {
+	__u16 global;
+	__u16 periodic;
+	__u16 constant;
+	__u16 spring;
+	__u16 damper;
+	__u16 friction;
+	__u16 inertia;
+};
+
 struct lg4ff_device_entry {
 	__u32 product_id;
 	__u16 range;
 	__u16 min_range;
 	__u16 max_range;
+	struct timer_list timer;
 	struct lg4ff_hw_effect_slot hw_slots[4];
+	__u8 cmd_queue[COMMAND_QUEUE_SIZE][7];
+	__s8 queue_start;
+	__s8 queue_length;
 #ifdef CONFIG_LEDS_CLASS
 	__u8  led_state;
 	struct led_classdev *led[5];
 #endif
 	struct list_head list;
 	void (*set_range)(struct hid_device *hid, u16 range);
+	struct lg4ff_gain_levels gain;
 };
 
 static const signed short lg4ff_wheel_effects[] = {
@@ -77,6 +111,8 @@ static const signed short lg4ff_wheel_effects[] = {
 	FF_DAMPER,
 	FF_FRICTION,
 	FF_AUTOCENTER,
+	FF_GAIN,
+	FF_INERTIA, /* cheating here to set additional gains */
 	-1
 };
 
@@ -278,33 +314,87 @@ static __s8 lg4ff_get_slot(struct lg4ff_device_entry *entry, __s16 effect_id)
 	return -1;
 }
 
-static int lg4ff_send_command(struct input_dev *dev, int slot, const __u8 *cmd)
+static void lg4ff_send_command_now(struct input_dev *dev, struct lg4ff_device_entry *entry, const __u8 *cmd)
 {
 	struct hid_device *hid = input_get_drvdata(dev);
 	struct list_head *report_list = &hid->report_enum[HID_OUTPUT_REPORT].report_list;
 	struct hid_report *report = list_entry(report_list->next, struct hid_report, list);
 	__s32 *value = report->field[0]->value;
+	int i;
+	
+	for (i = 0; i < 7; i++)
+		value[i] = cmd[i];
+
+	hid_hw_request(hid, report, HID_REQ_SET_REPORT);
+
+	printk(KERN_DEBUG "Wheel command: %02x %02x %02x %02x %02x %02x %02x\n", 
+		cmd[0], cmd[1], cmd[2], cmd[3], cmd[4], cmd[5], cmd[6]);
+		
+	/* restart timer to minimum delay */
+	mod_timer(&entry->timer, jiffies + msecs_to_jiffies(COMMAND_RATE));
+}
+
+static int lg4ff_send_command(struct input_dev *dev, int slot, const __u8 *cmd)
+{
 	struct lg4ff_device_entry *entry = lg4ff_get_device_entry(dev);
-	int i, n = 0;
 	
 	/* check valid device entry */
 	if (entry == NULL)
 		return -EINVAL;
 	
-	for (i=0; i<7; i++) {
-		if (entry->hw_slots[slot].last_cmd[i] == cmd[i])
-			n++;
-		value[i] = cmd[i];
-	}
-	
-	if (n==7)
+	/* check if the command actually differs from the previous */
+	if (memcmp(entry->hw_slots[slot].last_cmd, cmd, 7) == 0)
 		return 0;
-	
+
 	memcpy(entry->hw_slots[slot].last_cmd, cmd, 7);
 	
-	hid_hw_request(hid, report, HID_REQ_SET_REPORT);
+	if (!timer_pending(&entry->timer)) {
+		// don't buffer if delay is not needed
+		printk(KERN_DEBUG "Skip queue\n");
+		lg4ff_send_command_now(dev, entry, cmd);
+		return 0;
+	}
 	
+	// check for space in the buffer
+	if (entry->queue_length == COMMAND_QUEUE_SIZE)
+		return -ENOSPC;
+
+	memcpy(entry->cmd_queue[END_QUEUE(entry)], cmd, 7);
+	entry->queue_length++;
+
 	return  0;
+}
+
+static void lg4ff_process_queue(struct input_dev *dev, struct lg4ff_device_entry *entry)
+{
+	if (entry->queue_length) {
+		lg4ff_send_command_now(dev, entry, entry->cmd_queue[entry->queue_start]);
+		entry->queue_start = NEXT_QUEUE(entry);
+		entry->queue_length--;
+	}
+}
+
+static void lg4ff_process_effects(struct input_dev *dev, struct lg4ff_device_entry *entry)
+{
+	// stub
+}
+
+static void lg4ff_timer_fired(unsigned long data)
+{
+	struct input_dev *dev = (struct input_dev *)data;
+	struct lg4ff_device_entry *entry = lg4ff_get_device_entry(dev);
+	unsigned long flags;
+	__s8 n = entry->queue_length;
+	
+	spin_lock_irqsave(&dev->event_lock, flags);
+	
+	/* send a command in the queue buffer */
+	lg4ff_process_queue(dev, entry);
+	
+	/* process emulated effect */ 
+	lg4ff_process_effects(dev, entry);
+
+	spin_unlock_irqrestore(&dev->event_lock, flags);
 }
 
 static int lg4ff_upload_effect(struct input_dev *dev,
@@ -314,6 +404,7 @@ static int lg4ff_upload_effect(struct input_dev *dev,
 	__u8 c[7];
 	__s8 cmd, slot;
 	int x, y, cr, cl;
+	__u16 gain;
 
 	/* check valid device entry */
 	if (entry == NULL)
@@ -344,8 +435,12 @@ static int lg4ff_upload_effect(struct input_dev *dev,
 
 	switch (effect->type) {
 		case FF_CONSTANT:
-			printk(KERN_DEBUG "Wheel constant: %i, direction %u\n", effect->u.constant.level * 0xff / 0xffff, effect->direction);
-			x = 0x80 - effect->u.constant.level * 0xff / 0xffff;
+			printk(KERN_DEBUG "Wheel constant: %i, direction %u, gain %i %i\n", 
+					effect->u.constant.level * 0xff / 0xffff, effect->direction,
+					entry->gain.global, entry->gain.constant);
+
+			gain = entry->gain.global * entry->gain.constant / FF_GAIN_FULL;
+			x = 0x80 - clamp(effect->u.constant.level * gain / FF_GAIN_FULL, -32768, 32767) / 256;
 			c[1] = 0x00;
 			c[2] = x;
 			c[3] = x;
@@ -354,60 +449,93 @@ static int lg4ff_upload_effect(struct input_dev *dev,
 			c[6] = 0;
 			break;
 		case FF_DAMPER:
-			printk(KERN_DEBUG "Wheel damper: %i %i, sat %i %i\n", effect->u.condition[0].right_coeff
-			                                                    , effect->u.condition[0].left_coeff
-			                                                    , effect->u.condition[0].right_saturation
-			                                                    , effect->u.condition[0].left_saturation);
+			printk(KERN_DEBUG "Wheel damper: %i %i, sat %i %i, gain %i %i\n",
+					effect->u.condition[0].right_coeff,
+					effect->u.condition[0].left_coeff,
+					effect->u.condition[0].right_saturation,
+					effect->u.condition[0].left_saturation,
+					entry->gain.global, entry->gain.damper);
 
+			gain = entry->gain.global * entry->gain.damper / FF_GAIN_FULL;
+			printk(KERN_DEBUG "gain %x %x\n", gain, effect->u.condition[0].right_coeff * gain / FF_GAIN_FULL / 2048);
 			/* calculate damper force values */
-			x = max(effect->u.condition[0].right_coeff / 2048, -15);
-			y = max(effect->u.condition[0].left_coeff / 2048, -15);
+			x = clamp(effect->u.condition[0].right_coeff * gain / FF_GAIN_FULL / 2048, -15, 15);
+			y = clamp(effect->u.condition[0].left_coeff * gain / FF_GAIN_FULL / 2048, -15, 15);
 			c[1] = 0x0C;
 			c[2] = abs(y);
 			c[3] = y < 0;
 			c[4] = abs(x);
 			c[5] = x < 0;
 			// saturation only supported on DFP and newer
-			c[6] = max(effect->u.condition[0].right_saturation / 256, 2);
+			c[6] = clamp(effect->u.condition[0].right_saturation * gain / FF_GAIN_FULL_U / 256, 2u, 255u);
 			break;
 		case FF_SPRING:
-			printk(KERN_DEBUG "Wheel spring coef: %i % i, sat: %i center: %i deadband: %i\n",
+			printk(KERN_DEBUG "Wheel spring coef: %i % i, sat: %i center: %i deadband: %i, gain %i %i\n",
 			                   effect->u.condition[0].right_coeff,
 			                   effect->u.condition[0].left_coeff,
 			                   effect->u.condition[0].right_saturation,
 			                   effect->u.condition[0].center,
-			                   effect->u.condition[0].deadband);
+			                   effect->u.condition[0].deadband,
+			                   entry->gain.global, entry->gain.spring);
 
+			gain = entry->gain.global * entry->gain.spring / FF_GAIN_FULL;
 			/* calculate offsets */
 			x = clamp(effect->u.condition[0].center - effect->u.condition[0].deadband/2 + 0x8000, 0, 0xffff) >> 5;
 			y = clamp(effect->u.condition[0].center + effect->u.condition[0].deadband/2 + 0x8000, 0, 0xffff) >> 5;
 			printk(KERN_DEBUG "offsets %x %x\n", x, y);
 			/* calculate coefs */
-			cr = max(effect->u.condition[0].right_coeff / 2048, -15);
-			cl = max(effect->u.condition[0].left_coeff / 2048, -15);
+			cr = clamp(effect->u.condition[0].right_coeff * gain / FF_GAIN_FULL / 2048, -15, 15);
+			cl = clamp(effect->u.condition[0].left_coeff * gain / FF_GAIN_FULL / 2048, -15, 15);
 			c[1] = 0x0B;
 			c[2] = x >> 3;
 			c[3] = y >> 3;
 			c[4] = 16 * abs(cr) + abs(cl);
 			c[5] = (x & 7) * 32 + (cr & 16) + (y & 7) * 2 + (cl < 0);
-			c[6] = max(effect->u.condition[0].right_saturation / 256, 1);
+			c[6] = clamp(effect->u.condition[0].right_saturation * gain / FF_GAIN_FULL_U / 256, 1u, 255u);
 			break;
 		case FF_FRICTION:
-			printk(KERN_DEBUG "Wheel friction: %i %i, sat %i %i\n", effect->u.condition[0].right_coeff
-			                                                      , effect->u.condition[0].left_coeff
-			                                                      , effect->u.condition[0].right_saturation
-			                                                      , effect->u.condition[0].left_saturation);
+			printk(KERN_DEBUG "Wheel friction: %i %i, sat %i %i, gain %i %i\n",
+					effect->u.condition[0].right_coeff,
+					effect->u.condition[0].left_coeff,
+					effect->u.condition[0].right_saturation,
+					effect->u.condition[0].left_saturation,
+					entry->gain.global, entry->gain.friction);
 
+			gain = entry->gain.global * entry->gain.friction / FF_GAIN_FULL;
 			/* calculate friction force values */
-			x = max(effect->u.condition[0].right_coeff / 256, -255);
-			y = max(effect->u.condition[0].left_coeff / 256, -255);
+			x = clamp(effect->u.condition[0].right_coeff * gain / FF_GAIN_FULL / 2048, -15, 15);
+			y = clamp(effect->u.condition[0].left_coeff * gain / FF_GAIN_FULL / 2048, -15, 15);
 			c[1] = 0x0E;
 			c[2] = abs(y);
 			c[3] = abs(x);
-			c[4] = effect->u.condition[0].right_saturation / 256;
+			c[4] = min(effect->u.condition[0].right_saturation * gain / FF_GAIN_FULL_U / 256, 255u);
 			c[5] = 16*(x < 0) + (y < 0);
 			c[6] = 0;
 			break;
+		case FF_INERTIA:
+			switch (effect->u.condition[0].left_saturation) {
+				case FF_GAIN_PERIODIC:
+					entry->gain.periodic = effect->u.condition[0].right_saturation;
+					break;
+				case FF_GAIN_CONSTANT:
+					entry->gain.constant = effect->u.condition[0].right_saturation;
+					break;
+				case FF_GAIN_SPRING:
+					entry->gain.spring = effect->u.condition[0].right_saturation;
+					break;
+				case FF_GAIN_FRICTION:
+					entry->gain.friction = effect->u.condition[0].right_saturation;
+					break;
+				case FF_GAIN_DAMPER:
+					entry->gain.damper = effect->u.condition[0].right_saturation;
+					break;
+				case FF_GAIN_INERTIA:
+					entry->gain.inertia = effect->u.condition[0].right_saturation;
+					break;
+				default:
+					break;
+			}
+			return -1;
 		default:
 			printk(KERN_DEBUG "Unexpected force type %i!", effect->type);
 			return -EINVAL;
@@ -664,6 +792,13 @@ static void hid_lg4ff_set_range_dfp(struct hid_device *hid, __u16 range)
 	value[6] = 0xff;
 
 	hid_hw_request(hid, report, HID_REQ_SET_REPORT);
+}
+
+static void lg4ff_set_gain(struct input_dev *dev, u16 gain)
+{
+	struct lg4ff_device_entry *entry = lg4ff_get_device_entry(dev);
+	
+	entry->gain.global = gain;
 }
 
 static int lg4ff_switch_mode(struct hid_device *hid, const struct lg4ff_mode_switch_cmd *cmd)
@@ -946,7 +1081,7 @@ int lg4ff_init(struct hid_device *hid, const int switch_force_mode)
 	ff = dev->ff;
 	ff->upload = lg4ff_upload_effect;
 	ff->erase = lg4ff_erase_effect;
-	//ff->set_gain = lg4ff_set_gain;
+	ff->set_gain = lg4ff_set_gain;
 	ff->playback = lg4ff_playback;
 
 	/* Get private driver data */
@@ -970,6 +1105,9 @@ int lg4ff_init(struct hid_device *hid, const int switch_force_mode)
 	entry->set_range = lg4ff_devices[i].set_range;
 	for (i = 0; i < 4; i++)
 		entry->hw_slots[i].effect_id = -1;
+	memset(&entry->gain, 0xaa, sizeof(struct lg4ff_gain_levels));
+
+	setup_timer(&entry->timer, lg4ff_timer_fired, (unsigned long)dev);
 
 	/* Check if autocentering is available and
 	 * set the centering force to zero by default */
